@@ -1,6 +1,9 @@
-// app.js with strict XSS protection, logging, and security checklist
+// app.js with in-app brute-force protection (Fail2Ban alternative)
 
 const express = require('express')
+
+const path = require('path');
+
 const bodyParser = require('body-parser')
 const helmet = require('helmet')
 const fs = require('fs')
@@ -12,13 +15,17 @@ const mongoSanitize = require('express-mongo-sanitize')
 const createDOMPurify = require('dompurify')
 const { JSDOM } = require('jsdom')
 const winston = require('winston')
+const cors = require('cors')
+const rateLimit = require('express-rate-limit')
+require('dotenv').config()
 
 const window = new JSDOM('').window
 const DOMPurify = createDOMPurify(window)
 
 const app = express()
 const port = 3000
-const SECRET_KEY = 'your-secret-key'
+const SECRET_KEY = process.env.JWT_SECRET || 'your-secret-key'
+const API_KEY = process.env.API_KEY || 'your-secure-api-key'
 
 // Logger setup
 const logger = winston.createLogger({
@@ -45,7 +52,6 @@ mongoose.connect('mongodb://127.0.0.1:27017/vulnerable-xss-app', {
 }).then(() => logger.info('MongoDB connected'))
   .catch(err => logger.error('MongoDB connection error:', err))
 
-// Define a simple User model
 const User = mongoose.model('User', new mongoose.Schema({
   email: String,
   password: String
@@ -53,15 +59,51 @@ const User = mongoose.model('User', new mongoose.Schema({
 
 // Middleware
 app.use(helmet())
+app.use(helmet.contentSecurityPolicy({
+  directives: {
+    defaultSrc: ["'self'"],
+    scriptSrc: ["'self'"],
+    objectSrc: ["'none'"],
+    upgradeInsecureRequests: []
+  }
+}))
+app.use(helmet.hsts({
+  maxAge: 31536000,
+  includeSubDomains: true,
+  preload: true
+}))
+
+app.use(cors({
+  origin: 'https://your-frontend-domain.com',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}))
+
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }))
 app.use(bodyParser.json())
 app.use(mongoSanitize())
 
-// Static files
+// Rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests from this IP, try again later.'
+})
+
+app.use('/login', apiLimiter)
+app.use('/register', apiLimiter)
+
+// Brute-force protection
+const failedLogins = new Map()
+const MAX_ATTEMPTS = 5
+const BLOCK_TIME = 15 * 60 * 1000
+
+// Static
 app.use('/media', express.static('media'))
 app.use('/scripts', express.static('scripts'))
+app.use('/public', express.static(path.join(__dirname, 'public')))
 
-// Strict XSS-safe routes
+
 const sanitizeAndEscape = (dirty) => {
   const clean = DOMPurify.sanitize(dirty, {
     USE_PROFILES: false,
@@ -71,6 +113,14 @@ const sanitizeAndEscape = (dirty) => {
   return escapeHTML(clean)
 }
 
+// API Key protection
+app.use('/api/secure', (req, res, next) => {
+  const apiKey = req.headers['x-api-key']
+  if (apiKey !== API_KEY) return res.status(403).send('Forbidden')
+  next()
+})
+
+// Routes
 app.get('/', (req, res) => {
   const dirty = req.query.xss || ''
   const output = sanitizeAndEscape(dirty)
@@ -89,7 +139,7 @@ app.get('/remove', (req, res) => {
   res.send(`<html><body><strong>Filtered Input:</strong><div>${output}</div></body></html>`)
 })
 
-// Logging for keylogger and screenshot
+// Logging
 app.post('/keylogger', (req, res) => {
   logger.warn(`Key press detected: ${req.body.data}`)
   res.send('')
@@ -105,7 +155,7 @@ app.post('/screenshot', (req, res) => {
   res.send('Logged')
 })
 
-// Register route with input validation and hashing
+// Register
 app.post('/register', async (req, res) => {
   const { email, password } = req.body
   if (!validator.isEmail(email)) return res.status(400).send('Invalid email')
@@ -118,30 +168,38 @@ app.post('/register', async (req, res) => {
   res.send('User registered successfully')
 })
 
-// Login route with JWT
+// Login with brute-force protection
 app.post('/login', async (req, res) => {
+  const ip = req.ip
+  const now = Date.now()
+  const record = failedLogins.get(ip) || { count: 0, lastAttempt: now }
+
+  if (record.count >= MAX_ATTEMPTS && (now - record.lastAttempt) < BLOCK_TIME) {
+    logger.warn(`IP blocked due to repeated login failures: ${ip}`)
+    return res.status(429).send('Too many login attempts. Please try again later.')
+  }
+
   const { email, password } = req.body
   const user = await User.findOne({ email })
-  if (!user) return res.status(401).send('Invalid credentials')
-  const isMatch = await bcrypt.compare(password, user.password)
-  if (!isMatch) return res.status(401).send('Invalid credentials')
+
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    failedLogins.set(ip, {
+      count: record.count + 1,
+      lastAttempt: now
+    })
+    logger.warn(`Failed login attempt for email: ${email} from IP: ${ip}`)
+    return res.status(401).send('Invalid credentials')
+  }
+
+  failedLogins.delete(ip)
   const token = jwt.sign({ id: user._id }, SECRET_KEY, { expiresIn: '1h' })
-  logger.info(`User logged in: ${email}`)
+  logger.info(`User logged in: ${email} from IP: ${ip}`)
   res.send({ token })
 })
 
-app.listen(port, () => logger.info(`Listening on port ${port}`))
+// Optional: view blocked IPs (secure this in production)
+app.get('/admin/attempts', (req, res) => {
+  res.json(Object.fromEntries(failedLogins))
+})
 
-/*
-Security Checklist:
--------------------
-- ✅ Validate all inputs
-- ✅ Sanitize and escape user input (DOMPurify + escapeHTML)
-- ✅ Hash and salt passwords (bcrypt)
-- ✅ Use JWTs for authentication
-- ✅ Sanitize Mongo inputs (express-mongo-sanitize)
-- ✅ Use Helmet.js to secure HTTP headers
-- 🔒 Use HTTPS for secure data transmission (Configure reverse proxy or SSL cert)
-- 🧪 Perform basic penetration testing using tools like Nmap or browser-based tools
-- 📝 All logs saved to 'security.log' using Winston
-*/
+app.listen(port, () => logger.info(`Listening on port ${port}`))
